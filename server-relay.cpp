@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,16 +10,36 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-// basic tcp relay prototype
 constexpr uint16_t LOCAL_PORT = 1082;
 constexpr uint16_t UPSTREAM_PORT = 1081;
 const char* UPSTREAM_IP = "172.28.16.1";
 constexpr int MAX_EVENTS = 64;
 
+struct Session;
+
 struct Endpoint {
+    Session* session = nullptr;
     int fd = -1;
-    int peer_fd = -1;
+    bool is_upstream = false;
 };
+
+struct Session {
+    Endpoint client;
+    Endpoint upstream;
+};
+
+void close_session(int epfd, Session* s) {
+    if (!s) return;
+    if (s->client.fd >= 0) {
+        epoll_ctl(epfd, EPOLL_CTL_DEL, s->client.fd, nullptr);
+        close(s->client.fd);
+    }
+    if (s->upstream.fd >= 0) {
+        epoll_ctl(epfd, EPOLL_CTL_DEL, s->upstream.fd, nullptr);
+        close(s->upstream.fd);
+    }
+    delete s;
+}
 
 int set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -26,6 +47,9 @@ int set_nonblock(int fd) {
 }
 
 int main() {
+    // ignore sigpipe when client closes unexpectedly
+    signal(SIGPIPE, SIG_IGN);
+
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket");
@@ -81,27 +105,29 @@ int main() {
                 set_nonblock(client_fd);
                 set_nonblock(upstream_fd);
 
-                Endpoint* ep_client = new Endpoint{client_fd, upstream_fd};
-                Endpoint* ep_upstream = new Endpoint{upstream_fd, client_fd};
+                Session* s = new Session();
+                s->client = {s, client_fd, false};
+                s->upstream = {s, upstream_fd, true};
 
                 epoll_event cev{};
                 cev.events = EPOLLIN;
-                cev.data.ptr = ep_client;
+                cev.data.ptr = &s->client;
                 epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cev);
 
                 epoll_event uev{};
                 uev.events = EPOLLIN;
-                uev.data.ptr = ep_upstream;
+                uev.data.ptr = &s->upstream;
                 epoll_ctl(epfd, EPOLL_CTL_ADD, upstream_fd, &uev);
             } else {
                 Endpoint* ep = static_cast<Endpoint*>(events[i].data.ptr);
+                Session* s = ep->session;
+                Endpoint* peer = ep->is_upstream ? &s->client : &s->upstream;
+
                 ssize_t bytes = recv(ep->fd, buf, sizeof(buf), 0);
                 if (bytes <= 0) {
-                    close(ep->fd);
-                    close(ep->peer_fd);
-                    delete ep;
+                    close_session(epfd, s);
                 } else {
-                    send(ep->peer_fd, buf, bytes, 0);
+                    send(peer->fd, buf, bytes, 0);
                 }
             }
         }
