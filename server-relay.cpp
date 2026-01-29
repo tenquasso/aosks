@@ -23,20 +23,24 @@ in_addr_t get_gateway_ip() {
     char line[256];
     fgets(line, sizeof(line), fp);
 
-    in_addr_t gw_ip = INADDR_NONE;
+    in_addr_t best_gw = INADDR_NONE;
+    unsigned int best_metric = UINT32_MAX;
+
     while (fgets(line, sizeof(line), fp)) {
         char iface[32];
-        unsigned int dest = 0, gw = 0, flags = 0;
-        if (sscanf(line, "%31s %x %x %x", iface, &dest, &gw, &flags) != 4)
+        unsigned int dest = 0, gw = 0, flags = 0, metric = UINT32_MAX;
+        if (sscanf(line, "%31s %x %x %x %*u %*u %u",
+                   iface, &dest, &gw, &flags, &metric) != 5)
             continue;
 
-        if (dest == 0 && (flags & 0x3) == 0x3 && gw != 0) {
-            gw_ip = static_cast<in_addr_t>(gw);
-            break;
+        if (dest == 0 && (flags & 0x3) == 0x3 &&
+            gw != 0 && metric < best_metric) {
+            best_gw = static_cast<in_addr_t>(gw);
+            best_metric = metric;
         }
     }
     fclose(fp);
-    return gw_ip;
+    return best_gw;
 }
 
 struct Session;
