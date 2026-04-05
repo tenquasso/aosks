@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -14,6 +18,7 @@
 constexpr uint16_t LOCAL_PORT = 1082;
 constexpr uint16_t UPSTREAM_PORT = 1081;
 constexpr int MAX_EVENTS = 1024;
+constexpr size_t SPLICE_LEN = 65536;
 
 static int epfd = -1;
 
@@ -55,6 +60,8 @@ struct Endpoint {
 struct Session {
     Endpoint client;
     Endpoint upstream;
+    int pipe_c2u[2] = {-1, -1};
+    int pipe_u2c[2] = {-1, -1};
     bool closing = false;
 };
 
@@ -68,6 +75,8 @@ void close_session(Session* s) {
         epoll_ctl(epfd, EPOLL_CTL_DEL, s->upstream.fd, nullptr);
         close(s->upstream.fd);
     }
+    for (int fd : s->pipe_c2u) if (fd >= 0) close(fd);
+    for (int fd : s->pipe_u2c) if (fd >= 0) close(fd);
     delete s;
 }
 
@@ -76,6 +85,28 @@ void mark_for_close(Session* s, Session** list, int& count) {
     s->closing = true;
     if (count < MAX_EVENTS) {
         list[count++] = s;
+    }
+}
+
+// zero-copy pump using splice
+bool pump_splice(Endpoint& src, Endpoint& dst, int pipefd[2]) {
+    for (;;) {
+        ssize_t in = splice(src.fd, nullptr, pipefd[1], nullptr,
+                            SPLICE_LEN, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+        if (in > 0) {
+            ssize_t out = splice(pipefd[0], nullptr, dst.fd, nullptr,
+                                 in, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+            if (out < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+                return false;
+            }
+            continue;
+        }
+
+        if (in == 0) return false;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+        return false;
     }
 }
 
@@ -113,6 +144,12 @@ void handle_accept(int server_fd) {
         Session* s = new Session();
         s->client = {s, client_fd, false};
         s->upstream = {s, upstream_fd, true};
+
+        if (pipe2(s->pipe_c2u, O_NONBLOCK | O_CLOEXEC) < 0 ||
+            pipe2(s->pipe_u2c, O_NONBLOCK | O_CLOEXEC) < 0) {
+            close_session(s);
+            continue;
+        }
 
         epoll_event ev{};
         ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
@@ -155,7 +192,6 @@ int main() {
         return 1;
     }
 
-    // edge-triggered to reduce epoll wakeups
     epoll_event ev{};
     ev.events = EPOLLIN | EPOLLET;
     ev.data.ptr = nullptr;
@@ -164,7 +200,6 @@ int main() {
     printf("server relay listening on 127.0.0.1:%u\n", LOCAL_PORT);
 
     epoll_event events[MAX_EVENTS];
-    char buf[4096];
 
     for (;;) {
         int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
@@ -187,27 +222,8 @@ int main() {
             Session* s = ep->session;
             if (!s || s->closing) continue;
 
-            Endpoint* peer = ep->is_upstream ? &s->client : &s->upstream;
-
-            // drain socket until EAGAIN
-            bool dead = false;
-            while (true) {
-                ssize_t bytes = recv(ep->fd, buf, sizeof(buf), 0);
-                if (bytes > 0) {
-                    send(peer->fd, buf, bytes, 0);
-                    continue;
-                }
-                if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    break;
-                }
-                if (bytes < 0 && errno == EINTR) {
-                    continue;
-                }
-                dead = true;
-                break;
-            }
-
-            if (dead) {
+            if (!pump_splice(s->client, s->upstream, s->pipe_c2u) ||
+                !pump_splice(s->upstream, s->client, s->pipe_u2c)) {
                 mark_for_close(s, to_close, close_count);
             }
         }
