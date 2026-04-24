@@ -62,6 +62,8 @@ struct Session {
     Endpoint upstream;
     int pipe_c2u[2] = {-1, -1};
     int pipe_u2c[2] = {-1, -1};
+    ssize_t c2u_buffered = 0;
+    ssize_t u2c_buffered = 0;
     bool closing = false;
 };
 
@@ -88,22 +90,30 @@ void mark_for_close(Session* s, Session** list, int& count) {
     }
 }
 
-// zero-copy pump using splice
-bool pump_splice(Endpoint& src, Endpoint& dst, int pipefd[2]) {
+// pump data using splice and drain pipe backlog on EAGAIN
+bool pump_splice(Endpoint& src, Endpoint& dst,
+                 int pipefd[2], ssize_t& buffered) {
     for (;;) {
-        ssize_t in = splice(src.fd, nullptr, pipefd[1], nullptr,
-                            SPLICE_LEN, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
-        if (in > 0) {
-            ssize_t out = splice(pipefd[0], nullptr, dst.fd, nullptr,
-                                 in, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
-            if (out < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-                return false;
+        while (buffered > 0) {
+            ssize_t n = splice(pipefd[0], nullptr, dst.fd, nullptr,
+                               static_cast<size_t>(buffered),
+                               SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+            if (n > 0) {
+                buffered -= n;
+                continue;
             }
-            continue;
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+            return false;
         }
 
-        if (in == 0) return false;
+        ssize_t n = splice(src.fd, nullptr, pipefd[1], nullptr,
+                           SPLICE_LEN, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+        if (n > 0) {
+            buffered += n;
+            continue;
+        }
+        if (n == 0) return false;
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
         return false;
@@ -222,8 +232,10 @@ int main() {
             Session* s = ep->session;
             if (!s || s->closing) continue;
 
-            if (!pump_splice(s->client, s->upstream, s->pipe_c2u) ||
-                !pump_splice(s->upstream, s->client, s->pipe_u2c)) {
+            if (!pump_splice(s->client, s->upstream,
+                             s->pipe_c2u, s->c2u_buffered) ||
+                !pump_splice(s->upstream, s->client,
+                             s->pipe_u2c, s->u2c_buffered)) {
                 mark_for_close(s, to_close, close_count);
             }
         }
