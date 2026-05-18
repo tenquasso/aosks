@@ -55,6 +55,8 @@ struct Endpoint {
     Session* session = nullptr;
     int fd = -1;
     bool is_upstream = false;
+    bool read_eof = false;
+    bool write_eof = false;
 };
 
 struct Session {
@@ -90,7 +92,6 @@ void mark_for_close(Session* s, Session** list, int& count) {
     }
 }
 
-// pump data using splice and drain pipe backlog on EAGAIN
 bool pump_splice(Endpoint& src, Endpoint& dst,
                  int pipefd[2], ssize_t& buffered) {
     for (;;) {
@@ -107,13 +108,24 @@ bool pump_splice(Endpoint& src, Endpoint& dst,
             return false;
         }
 
+        if (src.read_eof) {
+            if (!dst.write_eof) {
+                shutdown(dst.fd, SHUT_WR);
+                dst.write_eof = true;
+            }
+            return true;
+        }
+
         ssize_t n = splice(src.fd, nullptr, pipefd[1], nullptr,
                            SPLICE_LEN, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         if (n > 0) {
             buffered += n;
             continue;
         }
-        if (n == 0) return false;
+        if (n == 0) {
+            src.read_eof = true;
+            continue;
+        }
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
         return false;
@@ -152,8 +164,8 @@ void handle_accept(int server_fd) {
         connect(upstream_fd, (sockaddr*)&addr, sizeof(addr));
 
         Session* s = new Session();
-        s->client = {s, client_fd, false};
-        s->upstream = {s, upstream_fd, true};
+        s->client = {s, client_fd, false, false, false};
+        s->upstream = {s, upstream_fd, true, false, false};
 
         if (pipe2(s->pipe_c2u, O_NONBLOCK | O_CLOEXEC) < 0 ||
             pipe2(s->pipe_u2c, O_NONBLOCK | O_CLOEXEC) < 0) {
@@ -236,6 +248,12 @@ int main() {
                              s->pipe_c2u, s->c2u_buffered) ||
                 !pump_splice(s->upstream, s->client,
                              s->pipe_u2c, s->u2c_buffered)) {
+                mark_for_close(s, to_close, close_count);
+                continue;
+            }
+
+            if (s->client.read_eof && s->upstream.read_eof &&
+                s->c2u_buffered == 0 && s->u2c_buffered == 0) {
                 mark_for_close(s, to_close, close_count);
             }
         }
