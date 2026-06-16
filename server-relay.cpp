@@ -57,6 +57,7 @@ struct Endpoint {
     bool is_upstream = false;
     bool read_eof = false;
     bool write_eof = false;
+    bool connecting = false;
 };
 
 struct Session {
@@ -161,11 +162,16 @@ void handle_accept(int server_fd) {
         addr.sin_port = htons(UPSTREAM_PORT);
         addr.sin_addr.s_addr = gateway;
 
-        connect(upstream_fd, (sockaddr*)&addr, sizeof(addr));
+        int rc = connect(upstream_fd, (sockaddr*)&addr, sizeof(addr));
+        if (rc < 0 && errno != EINPROGRESS) {
+            close(client_fd);
+            close(upstream_fd);
+            continue;
+        }
 
         Session* s = new Session();
-        s->client = {s, client_fd, false, false, false};
-        s->upstream = {s, upstream_fd, true, false, false};
+        s->client = {s, client_fd, false, false, false, false};
+        s->upstream = {s, upstream_fd, true, false, false, rc < 0};
 
         if (pipe2(s->pipe_c2u, O_NONBLOCK | O_CLOEXEC) < 0 ||
             pipe2(s->pipe_u2c, O_NONBLOCK | O_CLOEXEC) < 0) {
@@ -243,6 +249,21 @@ int main() {
             Endpoint* ep = static_cast<Endpoint*>(events[i].data.ptr);
             Session* s = ep->session;
             if (!s || s->closing) continue;
+
+            uint32_t revents = events[i].events;
+
+            if (ep->connecting &&
+                (revents & (EPOLLOUT | EPOLLERR | EPOLLHUP))) {
+                int err = 0;
+                socklen_t len = sizeof(err);
+                if (getsockopt(ep->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+                    mark_for_close(s, to_close, close_count);
+                    continue;
+                }
+                ep->connecting = false;
+            }
+
+            if (s->upstream.connecting) continue;
 
             if (!pump_splice(s->client, s->upstream,
                              s->pipe_c2u, s->c2u_buffered) ||
