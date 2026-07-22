@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -47,6 +48,11 @@ in_addr_t get_gateway_ip() {
     }
     fclose(fp);
     return best_gw;
+}
+
+void tune_socket(int fd) {
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
 struct Session;
@@ -156,6 +162,9 @@ void handle_accept(int server_fd) {
             close(client_fd);
             continue;
         }
+
+        tune_socket(client_fd);
+        tune_socket(upstream_fd);
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
