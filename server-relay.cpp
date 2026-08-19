@@ -14,18 +14,35 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
+
+#include <algorithm>
+#include <new>
 
 constexpr uint16_t LOCAL_PORT = 1082;
 constexpr uint16_t UPSTREAM_PORT = 1081;
 constexpr int MAX_EVENTS = 1024;
 constexpr size_t SPLICE_LEN = 65536;
+constexpr time_t GW_CACHE_TTL_SEC = 3;
 
 static int epfd = -1;
 
 in_addr_t get_gateway_ip() {
+    static in_addr_t cached_gw = INADDR_NONE;
+    static time_t last_check = 0;
+
+    timespec ts{};
+    if (clock_gettime(CLOCK_MONOTONIC_COARSE, &ts) < 0)
+        return cached_gw;
+
+    if (cached_gw != INADDR_NONE &&
+        ts.tv_sec - last_check < GW_CACHE_TTL_SEC)
+        return cached_gw;
+
     FILE* fp = fopen("/proc/net/route", "r");
-    if (!fp) return INADDR_NONE;
+    if (!fp)
+        return cached_gw;
 
     char line[256];
     fgets(line, sizeof(line), fp);
@@ -35,7 +52,11 @@ in_addr_t get_gateway_ip() {
 
     while (fgets(line, sizeof(line), fp)) {
         char iface[32];
-        unsigned int dest = 0, gw = 0, flags = 0, metric = UINT32_MAX;
+        unsigned int dest = 0;
+        unsigned int gw = 0;
+        unsigned int flags = 0;
+        unsigned int metric = UINT32_MAX;
+
         if (sscanf(line, "%31s %x %x %x %*u %*u %u",
                    iface, &dest, &gw, &flags, &metric) != 5)
             continue;
@@ -46,8 +67,15 @@ in_addr_t get_gateway_ip() {
             best_metric = metric;
         }
     }
+
     fclose(fp);
-    return best_gw;
+
+    if (best_gw != INADDR_NONE) {
+        cached_gw = best_gw;
+        last_check = ts.tv_sec;
+    }
+
+    return cached_gw;
 }
 
 void tune_socket(int fd) {
@@ -58,17 +86,17 @@ void tune_socket(int fd) {
 struct Session;
 
 struct Endpoint {
-    Session* session = nullptr;
-    int fd = -1;
-    bool is_upstream = false;
-    bool read_eof = false;
-    bool write_eof = false;
-    bool connecting = false;
+    Session* session;
+    int fd;
+    bool is_upstream;
+    bool read_eof;
+    bool write_eof;
+    bool connecting;
 };
 
 struct Session {
-    Endpoint client;
-    Endpoint upstream;
+    Endpoint client{};
+    Endpoint upstream{};
     int pipe_c2u[2] = {-1, -1};
     int pipe_u2c[2] = {-1, -1};
     ssize_t c2u_buffered = 0;
@@ -77,26 +105,26 @@ struct Session {
 };
 
 void close_session(Session* s) {
-    if (!s) return;
+    if (!s)
+        return;
+
     if (s->client.fd >= 0) {
         epoll_ctl(epfd, EPOLL_CTL_DEL, s->client.fd, nullptr);
         close(s->client.fd);
     }
+
     if (s->upstream.fd >= 0) {
         epoll_ctl(epfd, EPOLL_CTL_DEL, s->upstream.fd, nullptr);
         close(s->upstream.fd);
     }
-    for (int fd : s->pipe_c2u) if (fd >= 0) close(fd);
-    for (int fd : s->pipe_u2c) if (fd >= 0) close(fd);
-    delete s;
-}
 
-void mark_for_close(Session* s, Session** list, int& count) {
-    if (!s || s->closing) return;
-    s->closing = true;
-    if (count < MAX_EVENTS) {
-        list[count++] = s;
-    }
+    for (int fd : s->pipe_c2u)
+        if (fd >= 0) close(fd);
+
+    for (int fd : s->pipe_u2c)
+        if (fd >= 0) close(fd);
+
+    delete s;
 }
 
 bool pump_splice(Endpoint& src, Endpoint& dst,
@@ -106,12 +134,18 @@ bool pump_splice(Endpoint& src, Endpoint& dst,
             ssize_t n = splice(pipefd[0], nullptr, dst.fd, nullptr,
                                static_cast<size_t>(buffered),
                                SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+
             if (n > 0) {
                 buffered -= n;
                 continue;
             }
-            if (n < 0 && errno == EINTR) continue;
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+
+            if (n < 0 && errno == EINTR)
+                continue;
+
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                return true;
+
             return false;
         }
 
@@ -125,27 +159,46 @@ bool pump_splice(Endpoint& src, Endpoint& dst,
 
         ssize_t n = splice(src.fd, nullptr, pipefd[1], nullptr,
                            SPLICE_LEN, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+
         if (n > 0) {
             buffered += n;
             continue;
         }
+
         if (n == 0) {
             src.read_eof = true;
             continue;
         }
-        if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+
+        if (errno == EINTR)
+            continue;
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return true;
+
         return false;
     }
+}
+
+void mark_for_close(Session* s, Session** list, int& count) {
+    if (!s || s->closing)
+        return;
+
+    s->closing = true;
+    if (count < MAX_EVENTS)
+        list[count++] = s;
 }
 
 void handle_accept(int server_fd) {
     for (;;) {
         int client_fd = accept4(server_fd, nullptr, nullptr,
                                 SOCK_NONBLOCK | SOCK_CLOEXEC);
+
         if (client_fd < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
             perror("accept4");
             break;
         }
@@ -157,7 +210,9 @@ void handle_accept(int server_fd) {
             continue;
         }
 
-        int upstream_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        int upstream_fd = socket(AF_INET,
+                                 SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                                 0);
         if (upstream_fd < 0) {
             close(client_fd);
             continue;
@@ -171,14 +226,23 @@ void handle_accept(int server_fd) {
         addr.sin_port = htons(UPSTREAM_PORT);
         addr.sin_addr.s_addr = gateway;
 
-        int rc = connect(upstream_fd, (sockaddr*)&addr, sizeof(addr));
+        int rc = connect(upstream_fd,
+                         reinterpret_cast<sockaddr*>(&addr),
+                         sizeof(addr));
+
         if (rc < 0 && errno != EINPROGRESS) {
             close(client_fd);
             close(upstream_fd);
             continue;
         }
 
-        Session* s = new Session();
+        Session* s = new (std::nothrow) Session{};
+        if (!s) {
+            close(client_fd);
+            close(upstream_fd);
+            continue;
+        }
+
         s->client = {s, client_fd, false, false, false, false};
         s->upstream = {s, upstream_fd, true, false, false, rc < 0};
 
@@ -191,17 +255,25 @@ void handle_accept(int server_fd) {
         epoll_event ev{};
         ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
         ev.data.ptr = &s->client;
-        epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev);
+
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
+            close_session(s);
+            continue;
+        }
 
         ev.data.ptr = &s->upstream;
-        epoll_ctl(epfd, EPOLL_CTL_ADD, upstream_fd, &ev);
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, upstream_fd, &ev) < 0) {
+            close_session(s);
+            continue;
+        }
     }
 }
 
 int main() {
     signal(SIGPIPE, SIG_IGN);
 
-    int server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int server_fd = socket(AF_INET,
+                           SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (server_fd < 0) {
         perror("socket");
         return 1;
@@ -215,9 +287,9 @@ int main() {
     addr.sin_port = htons(LOCAL_PORT);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    if (bind(server_fd, (sockaddr*)&addr, sizeof(addr)) < 0 ||
+    if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0 ||
         listen(server_fd, SOMAXCONN) < 0) {
-        perror("bind/listen failed");
+        perror("bind/listen");
         close(server_fd);
         return 1;
     }
@@ -232,16 +304,24 @@ int main() {
     epoll_event ev{};
     ev.events = EPOLLIN | EPOLLET;
     ev.data.ptr = nullptr;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev);
+
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
+        perror("epoll_ctl");
+        close(epfd);
+        close(server_fd);
+        return 1;
+    }
 
     printf("server relay listening on 127.0.0.1:%u\n", LOCAL_PORT);
+    fflush(stdout);
 
     epoll_event events[MAX_EVENTS];
 
     for (;;) {
         int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             perror("epoll_wait");
             break;
         }
@@ -257,7 +337,9 @@ int main() {
 
             Endpoint* ep = static_cast<Endpoint*>(events[i].data.ptr);
             Session* s = ep->session;
-            if (!s || s->closing) continue;
+
+            if (!s || s->closing)
+                continue;
 
             uint32_t revents = events[i].events;
 
@@ -265,14 +347,18 @@ int main() {
                 (revents & (EPOLLOUT | EPOLLERR | EPOLLHUP))) {
                 int err = 0;
                 socklen_t len = sizeof(err);
-                if (getsockopt(ep->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+
+                if (getsockopt(ep->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 ||
+                    err != 0) {
                     mark_for_close(s, to_close, close_count);
                     continue;
                 }
+
                 ep->connecting = false;
             }
 
-            if (s->upstream.connecting) continue;
+            if (s->upstream.connecting)
+                continue;
 
             if (!pump_splice(s->client, s->upstream,
                              s->pipe_c2u, s->c2u_buffered) ||
@@ -288,9 +374,8 @@ int main() {
             }
         }
 
-        for (int i = 0; i < close_count; ++i) {
+        for (int i = 0; i < close_count; ++i)
             close_session(to_close[i]);
-        }
     }
 
     close(epfd);
