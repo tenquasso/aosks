@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <new>
 
+// default ports
 constexpr uint16_t LOCAL_PORT = 1082;
 constexpr uint16_t UPSTREAM_PORT = 1081;
 constexpr int MAX_EVENTS = 1024;
@@ -28,6 +29,8 @@ constexpr time_t GW_CACHE_TTL_SEC = 3;
 
 static int epfd = -1;
 
+// grab default gateway ip directly from linux routing table
+// caching it for a bit so we dont hammer /proc on rapid reconnects
 in_addr_t get_gateway_ip() {
     static in_addr_t cached_gw = INADDR_NONE;
     static time_t last_check = 0;
@@ -57,10 +60,12 @@ in_addr_t get_gateway_ip() {
         unsigned int flags = 0;
         unsigned int metric = UINT32_MAX;
 
+        // parse routing entries
         if (sscanf(line, "%31s %x %x %x %*u %*u %u",
                    iface, &dest, &gw, &flags, &metric) != 5)
             continue;
 
+        // dest 0.0.0.0 + RTF_UP | RTF_GATEWAY, pick lowest metric
         if (dest == 0 && (flags & 0x3) == 0x3 &&
             gw != 0 && metric < best_metric) {
             best_gw = static_cast<in_addr_t>(gw);
@@ -78,6 +83,7 @@ in_addr_t get_gateway_ip() {
     return cached_gw;
 }
 
+// disable nagle's alg so packets fly immediately
 void tune_socket(int fd) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -127,9 +133,11 @@ void close_session(Session* s) {
     delete s;
 }
 
+// zero-copy pump using kernel splice pipes
 bool pump_splice(Endpoint& src, Endpoint& dst,
                  int pipefd[2], ssize_t& buffered) {
     for (;;) {
+        // first drain anything stuck in pipe from previous EAGAIN
         while (buffered > 0) {
             ssize_t n = splice(pipefd[0], nullptr, dst.fd, nullptr,
                                static_cast<size_t>(buffered),
@@ -149,6 +157,7 @@ bool pump_splice(Endpoint& src, Endpoint& dst,
             return false;
         }
 
+        // half close handling: send FIN to destination once source EOFs
         if (src.read_eof) {
             if (!dst.write_eof) {
                 shutdown(dst.fd, SHUT_WR);
@@ -157,6 +166,7 @@ bool pump_splice(Endpoint& src, Endpoint& dst,
             return true;
         }
 
+        // pull next chunk from source socket into pipe
         ssize_t n = splice(src.fd, nullptr, pipefd[1], nullptr,
                            SPLICE_LEN, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
 
@@ -205,7 +215,7 @@ void handle_accept(int server_fd) {
 
         in_addr_t gateway = get_gateway_ip();
         if (gateway == INADDR_NONE) {
-            fprintf(stderr, "default gateway not found\n");
+            fprintf(stderr, "default gateway not found :(\n");
             close(client_fd);
             continue;
         }
