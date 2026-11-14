@@ -28,6 +28,12 @@ constexpr size_t SPLICE_LEN = 65536;
 constexpr time_t GW_CACHE_TTL_SEC = 3;
 
 static int epfd = -1;
+static volatile sig_atomic_t g_running = 1;
+
+void handle_signal(int sig) {
+    (void)sig;
+    g_running = 0;
+}
 
 // grab default gateway ip directly from linux routing table
 // caching it for a bit so we dont hammer /proc on rapid reconnects
@@ -282,6 +288,11 @@ void handle_accept(int server_fd) {
 int main() {
     signal(SIGPIPE, SIG_IGN);
 
+    struct sigaction sa{};
+    sa.sa_handler = handle_signal;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
     int server_fd = socket(AF_INET,
                            SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (server_fd < 0) {
@@ -327,7 +338,7 @@ int main() {
 
     epoll_event events[MAX_EVENTS];
 
-    for (;;) {
+    while (g_running) {
         int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
         if (n < 0) {
             if (errno == EINTR)
